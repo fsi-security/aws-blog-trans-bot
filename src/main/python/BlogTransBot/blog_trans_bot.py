@@ -8,10 +8,11 @@ import logging
 import io
 import os
 import json
+import requests
+from bs4 import BeautifulSoup
+import arrow
 
 import boto3
-import arrow
-from newspaper import Article
 
 LOGGER = logging.getLogger()
 if len(LOGGER.handlers) > 0:
@@ -39,7 +40,21 @@ MAX_SINGLE_TEXT_SIZE = 15*1204
 
 TRANS_CLIENT = None
 
+WEBHOOK_URL = os.environ['webHookUrl']
+SLACK_CHANNEL = os.environ['slackChannel']
 
+def send_message_to_slack(attachment):
+
+    url = WEBHOOK_URL
+    payload = { 
+        'channel': SLACK_CHANNEL,
+        'text' : '',
+        'attachments' : attachment,
+        'mrkdwn': "true",
+        'icon_url': 'http://dsbrrxis5yatj.cloudfront.net/aws.png'
+    } 
+    requests.post(url, json = payload)
+    
 def fwrite_s3(s3_client, doc, s3_bucket, s3_obj_key):
   output = io.StringIO()
   output.write(doc)
@@ -164,6 +179,7 @@ def translate(translator, text, src='en', dest='ko'):
 
 
 def lambda_handler(event, context):
+  
   LOGGER.debug('receive SNS message')
 
   s3_client = boto3.client('s3', region_name=AWS_REGION)
@@ -175,19 +191,31 @@ def lambda_handler(event, context):
 
     doc_id = msg['id']
     url = msg['link']
-    article = Article(url)
-    article.download()
-    article.parse()
-    meta_data = article.meta_data
-
-    section = meta_data['article']['section']
-    tag = meta_data['article']['tag']
-    published_time = meta_data['article']['published_time']
-
-    title, body_text = article.title, article.text
-
+    
+    print (url)
+    res = requests.get(url)
+    html = res.text
+    soup = BeautifulSoup(html, 'html.parser')
+        
+    article = soup.find("article", class_="blog-post")
+    
+    section_tag = soup.find("meta", property="article:section")
+    section = section_tag["content"].strip() if section_tag != None else ""
+        
+    tag_tag = article.find("span", class_="blog-post-categories")    
+    tag = tag_tag.text.strip() if tag_tag != None else ""
+        
+    pub_date_tag = article.find("time", property="datePublished")
+    published_time = pub_date_tag["datetime"].strip() if pub_date_tag != None else ""
+    
+    title_tag = article.find("h1", class_="lb-h2 blog-post-title", property="name headline")    
+    title = title_tag.text.strip() if title_tag != None else ""
+    
+    body_tag = article.find("section", class_="blog-post-content", property="articleBody")    
+    body_text = body_tag.text.strip() if body_tag != None else ""
+        
     #XX: https://py-googletrans.readthedocs.io/en/latest/
-    assert len(body_text) < MAX_SINGLE_TEXT_SIZE
+    # assert len(body_text) < MAX_SINGLE_TEXT_SIZE
 
     translator = get_or_create_translator(region_name=AWS_REGION)
     trans_title = translate(translator, title, dest=TRANS_DEST_LANG)
@@ -210,14 +238,30 @@ def lambda_handler(event, context):
       'tags': tag
     }
     html = gen_html(doc)
-
     if not DRY_RUN:
       subject = '''[translated] {title}'''.format(title=doc['title'])
       send_email(ses_client, EMAIL_FROM_ADDRESS, EMAIL_TO_ADDRESSES, subject, html)
+      #slack
+      attachment = [{
+          "fallback": "https://aws.amazon.com/blogs/security",
+          "pretext": subject,
+          "title": trans_title,
+          "title_link": url,
+          "text": '\n'.join(trans_body_texts),
+          "fields": [
+              {"title": "Date", "value": published_time, "short": "true"},
+              {"title": "Section", "value": section, "short": "true"},
+              {"title": "tags", "value": tag, "short": "false"},
+          ],
+          "mrkdwn_in": ["pretext"],
+          "color": "#ed7211"
+      }];
+      send_message_to_slack(attachment)
 
     s3_obj_key = '{}/{}-{}.html'.format(S3_OBJ_KEY_PREFIX,
       arrow.get(published_time).format('YYYYMMDD'), doc['doc_id'])
     fwrite_s3(s3_client, html, S3_BUCKET_NAME, s3_obj_key)
+    
   LOGGER.debug('done')
 
 
@@ -269,4 +313,3 @@ if __name__ == '__main__':
   lambda_handler(test_sns_event, {})
   end_t = time.time()
   LOGGER.info('run_time: {:.2f}'.format(end_t - start_t))
-
